@@ -1,0 +1,17 @@
+bin/
+lib/
+lib64/
+lib64
+include/
+share/
+etc/
+opt/
+pyvenv.cfg
+checkpoints/
+data/
+archive/
+drive/
+*.log
+nohup.out
+*.png
+.ipynb_checkpoints/

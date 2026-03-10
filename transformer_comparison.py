@@ -23,7 +23,7 @@
 
 # !pip install torch torchvision tqdm matplotlib
 
-import os, time, json, random, sys, gc
+import os, time, json, random, sys
 import numpy as np
 
 import torch
@@ -36,11 +36,11 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
 import matplotlib
-matplotlib.use('Agg')  # .py 실행 시 화면 없이 파일로만 저장
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from tqdm import tqdm, trange
+from IPython.display import display, clear_output
 
 # ── 재현성 ──
 SEED = 42
@@ -58,8 +58,7 @@ CFG = dict(
     data_dir      = './data',       # ImageFolder 루트
     img_size      = 64,             # 요청: 64
     crop_size     = 56,
-    batch_size    = 16,             # ANN (ResNet, Vanilla Transformer)
-    snn_batch_size= 4,              # SNN (Spikformer, S²TDPT) — T=4배 메모리
+    batch_size    = 16,             # 요청: 16
     train_ratio   = 0.8,
     num_workers   = 4,              # i5-6500T 4코어 풀 활용
     num_classes   = 2,
@@ -137,6 +136,15 @@ def denormalize(t):
     for c in range(img.shape[2]):
         img[:,:,c] = img[:,:,c] * STD[c] + MEAN[c]
     return img.clip(0,1)
+
+imgs, labs = next(iter(mini_loader))
+fig, axes = plt.subplots(1,4, figsize=(10,3))
+for ax, img, lb in zip(axes, imgs, labs):
+    ax.imshow(denormalize(img))
+    ax.set_title(dataset.classes[lb], fontsize=10)
+    ax.axis('off')
+plt.suptitle('Sample images (56×56 after crop)', fontweight='bold')
+plt.tight_layout(); plt.show()
 
 
 # ## 2. 공통 모듈 — LIF 뉴런 & 학습/평가 루프
@@ -236,25 +244,30 @@ def evaluate(model, loader, criterion, is_snn):
         total      += labels.size(0)
     return total_loss / len(loader), correct / total * 100
 
+from ipywidgets import Output
+_plot_out = Output()
+display(_plot_out)
+
 def _live_plot(history, name, color):
-    """에포크마다 커브를 파일로 저장"""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 3.5))
-    fig.suptitle(f'Training  —  {name}', fontsize=12, fontweight='bold')
-    ep = range(1, len(history['train_loss'])+1)
-    axes[0].plot(ep, history['train_loss'], '--', color=color, alpha=0.6, label='train')
-    axes[0].plot(ep, history['val_loss'],         color=color, label='val')
-    axes[0].set(title='Loss', xlabel='Epoch')
-    axes[0].legend(fontsize=9)
-    axes[0].grid(True, alpha=0.3)
-    axes[1].plot(ep, history['train_acc'], '--', color=color, alpha=0.6, label='train')
-    axes[1].plot(ep, history['val_acc'],         color=color, label='val')
-    axes[1].set(title='Accuracy (%)', xlabel='Epoch')
-    axes[1].legend(fontsize=9)
-    axes[1].grid(True, alpha=0.3)
-    plt.tight_layout()
-    safe_name = name.replace(' ', '_').replace('²', '2')
-    plt.savefig(f'live_{safe_name}.png', bbox_inches='tight')
-    plt.close(fig)
+    """에포크마다 Jupyter inline 커브 갱신"""
+    _plot_out.clear_output(wait=True)
+    with _plot_out:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3.5))
+        fig.suptitle(f'Live Training  —  {name}', fontsize=12, fontweight='bold')
+        ep = range(1, len(history['train_loss'])+1)
+        axes[0].plot(ep, history['train_loss'], '--', color=color, alpha=0.6, label='train')
+        axes[0].plot(ep, history['val_loss'],         color=color, label='val')
+        axes[0].set(title='Loss', xlabel='Epoch')
+        axes[0].legend(fontsize=9)
+        axes[0].grid(True, alpha=0.3)
+        axes[1].plot(ep, history['train_acc'], '--', color=color, alpha=0.6, label='train')
+        axes[1].plot(ep, history['val_acc'],         color=color, label='val')
+        axes[1].set(title='Accuracy (%)', xlabel='Epoch')
+        axes[1].legend(fontsize=9)
+        axes[1].grid(True, alpha=0.3)
+        plt.tight_layout()
+        display(fig)
+        plt.close(fig)
 
 
 PALETTE = {
@@ -266,24 +279,22 @@ PALETTE = {
 
 
 def run_training(model, name, is_snn=False, epochs=None):
+    global _plot_out
+    _plot_out.clear_output()
     """
-    학습 루프:
-      [1] 배치 tqdm bar
-      [2] 에포크마다 print + 커브 파일 저장
+    진행바 3단계:
+      [1] 배치 tqdm bar  (train + eval 각각)
+      [2] 에포크 trange bar
+      [3] 에포크마다 Jupyter inline 커브 갱신
     """
     global MODEL_BAR
     if MODEL_BAR is None:
-        MODEL_BAR = tqdm(total=len(MODEL_NAMES),
-                         desc='전체 학습 진행',
-                         bar_format='{desc}: {bar:40} {n}/{total}  [{elapsed}<{remaining}]',
-                         leave=True, file=sys.stdout)
+          MODEL_BAR = tqdm(total=len(MODEL_NAMES),
+                           desc='전체 학습 진행',
+                           bar_format='{desc}: {bar:40} {n}/{total}  [{elapsed}<{remaining}]',
+                           leave=True)
 
     epochs = epochs or CFG['epochs']
-    batch_size = CFG['snn_batch_size'] if is_snn else CFG['batch_size']
-    train_loader_local = DataLoader(train_ds, batch_size=batch_size,
-                                    shuffle=True, num_workers=CFG['num_workers'], pin_memory=False)
-    test_loader_local  = DataLoader(test_ds,  batch_size=batch_size,
-                                    shuffle=False, num_workers=CFG['num_workers'], drop_last=False)
     model  = model.to(device)
     crit   = nn.CrossEntropyLoss()
     opt    = optim.AdamW(model.parameters(),
@@ -296,14 +307,22 @@ def run_training(model, name, is_snn=False, epochs=None):
     color   = PALETTE.get(name, '#95A5A6')
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f'\n{"="*55}', flush=True)
-    print(f'  Training: {name}  |  params: {n_params:,}', flush=True)
-    print(f'{"="*55}', flush=True)
+    print(f'\n{"="*55}')
+    print(f'  Training: {name}  |  params: {n_params:,}')
+    print(f'{"="*55}')
+
+    # ── 에포크 진행바 ──────────────────────────────────
+    epoch_bar = trange(1, epochs+1,
+                       desc=f'{name[:18]:18s}',
+                       bar_format='{l_bar}{bar:30}{r_bar}',
+                       unit='ep', leave=True,
+                       file=sys.stdout,
+                       dynamic_ncols=False)
 
     for ep in range(1, epochs+1):
         t0 = time.time()
-        tr_loss, tr_acc = train_one_epoch(model, train_loader_local, opt, crit, is_snn)
-        va_loss, va_acc = evaluate(model, test_loader_local, crit, is_snn)
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, opt, crit, is_snn)
+        va_loss, va_acc = evaluate(model, test_loader, crit, is_snn)
         sched.step()
 
         history['train_loss'].append(tr_loss)
@@ -317,17 +336,26 @@ def run_training(model, name, is_snn=False, epochs=None):
 
         elapsed = time.time() - t0
         eta_h   = elapsed * (epochs - ep) / 3600
-        print(f'  Ep {ep:2d}/{epochs} | tr={tr_loss:.3f} va_acc={va_acc:.1f}% best={best_acc:.1f}% ETA={eta_h:.1f}h', flush=True)
+        print(f'  Ep {ep:2d}/{epochs} | tr={tr_loss:.3f} va_acc={va_acc:.1f}% best={best_acc:.1f}% ETA={eta_h:.1f}h')
+        _live_plot(history, name, color)
+
+        epoch_bar.set_postfix(
+            tr=f'{tr_loss:.3f}',
+            va_acc=f'{va_acc:.1f}%',
+            best=f'{best_acc:.1f}%',
+            ETA=f'{eta_h:.1f}h'
+        )
+
+        # ── inline 커브 갱신 ──────────────────────────
         _live_plot(history, name, color)
 
     total_min = (time.time() - t_start) / 60
-    print(f'  Best val acc: {best_acc:.2f}%  |  Total: {total_min:.1f} min', flush=True)
+    print(f'  Best val acc: {best_acc:.2f}%  |  Total: {total_min:.1f} min')
 
     ckpt_path = os.path.join(CFG['checkpoint_dir'],
                               f'{name.replace(" ","_")}_best.pth')
     torch.save({'model': best_state, 'history': history,
-                'best_acc': best_acc, 'name': name,
-                'train_mins': total_min}, ckpt_path)
+                'best_acc': best_acc, 'name': name}, ckpt_path)
 
     return history, best_acc, total_min
 
@@ -395,6 +423,15 @@ class ResNet(nn.Module):
         x = self.stage1(x); x = self.stage2(x)
         x = self.stage3(x); x = self.stage4(x)
         return self.fc(torch.flatten(self.pool(x), 1))
+
+
+
+
+# ## 4. Model B — Vanilla Transformer (ANN)
+# *패치 임베딩 → MHSA (softmax) → MLP — SNN과 동일 구조로 공정 비교*
+
+# In[ ]:
+
 
 class PatchEmbed(nn.Module):
     """이미지를 패치 시퀀스로 변환 (CNN stem)"""
@@ -464,28 +501,10 @@ class VanillaTransformer(nn.Module):
         return self.head(self.norm(x[:,0]))   # CLS token
 
 
-vanilla = VanillaTransformer(
-    img_size   = CFG['crop_size'],
-    patch_size = CFG['patch_size'],
-    embed_dim  = CFG['embed_dim'],
-    depth      = CFG['depth'],
-    num_heads  = CFG['num_heads'],
-    mlp_ratio  = CFG['mlp_ratio'],
-    num_classes= CFG['num_classes'],
-)
-print(f'VanillaTransformer params: {sum(p.numel() for p in vanilla.parameters()):,}')
 
 
-# In[ ]:
-
-
-h, acc, mins = run_training(vanilla, 'Vanilla Transformer', is_snn=False)
-ALL_RESULTS['Vanilla Transformer'] = (h, acc, mins)
-MODEL_BAR.update(1); MODEL_BAR.set_postfix(last=f'VanillaTF {acc:.1f}%')
-
-
-# ## 5. Model C — Spikformer (SSA)
-# *Zhou et al. 2022 — Spiking Self-Attention: Q·K elementwise multiply, no softmax*
+# ## 6. Model D — S²TDPT (논문 완전 재현)
+# *Mondal & Kumar 2025 — SPS + S²TDPSA (STDP Self-Attention) + Spiking MLP*
 
 # In[ ]:
 
@@ -619,33 +638,6 @@ class Spikformer(nn.Module):
         out = out / self.T                    # temporal mean
         out = out.mean(dim=1)                 # spatial mean (GAP)
         return self.head(out)
-
-
-spikformer = Spikformer(
-    img_size   = CFG['crop_size'],
-    embed_dim  = CFG['embed_dim'],
-    depth      = CFG['depth'],
-    num_heads  = CFG['num_heads'],
-    mlp_ratio  = CFG['mlp_ratio'],
-    num_classes= CFG['num_classes'],
-    T          = CFG['T'],
-)
-print(f'Spikformer params: {sum(p.numel() for p in spikformer.parameters()):,}')
-
-
-# In[ ]:
-
-
-h, acc, mins = run_training(spikformer, 'Spikformer', is_snn=True)
-ALL_RESULTS['Spikformer'] = (h, acc, mins)
-MODEL_BAR.update(1); MODEL_BAR.set_postfix(last=f'Spikformer {acc:.1f}%')
-
-
-# ## 6. Model D — S²TDPT (논문 완전 재현)
-# *Mondal & Kumar 2025 — SPS + S²TDPSA (STDP Self-Attention) + Spiking MLP*
-
-# In[ ]:
-
 
 class SPS(nn.Module):
     """
@@ -793,6 +785,7 @@ class S2TDPT(nn.Module):
         feat = feat.mean(dim=1)             # [B,D]
         return self.head(feat)
 
+
 # ── should_skip: 이미 학습된 모델 건너뛰기 ──
 def should_skip(model_name):
     safe_name = model_name.replace(' ', '_')
@@ -810,20 +803,19 @@ def should_skip(model_name):
 
 if __name__ == '__main__':
 
-    # ── 모델 학습 ──
     models_to_run = [
-        ('ResNet34',           lambda: ResNet(BasicBlock, [3,4,6,3], CFG['num_classes']), False),
+        ('ResNet34', lambda: ResNet(BasicBlock, [3,4,6,3], CFG['num_classes']), False),
         ('Vanilla Transformer', lambda: VanillaTransformer(
             img_size=CFG['crop_size'], patch_size=CFG['patch_size'],
             embed_dim=CFG['embed_dim'], depth=CFG['depth'],
             num_heads=CFG['num_heads'], mlp_ratio=CFG['mlp_ratio'],
             num_classes=CFG['num_classes']), False),
-        ('Spikformer',         lambda: Spikformer(
+        ('Spikformer', lambda: Spikformer(
             img_size=CFG['crop_size'], embed_dim=CFG['embed_dim'],
             depth=CFG['depth'], num_heads=CFG['num_heads'],
             mlp_ratio=CFG['mlp_ratio'], num_classes=CFG['num_classes'],
             T=CFG['T']), True),
-        ('S2TDPT',             lambda: S2TDPT(
+        ('S2TDPT', lambda: S2TDPT(
             img_size=CFG['crop_size'], embed_dim=CFG['embed_dim'],
             depth=CFG['depth'], num_heads=CFG['num_heads'],
             mlp_ratio=CFG['mlp_ratio'], num_classes=CFG['num_classes'],
@@ -833,10 +825,10 @@ if __name__ == '__main__':
 
     for model_name, model_fn, is_snn in models_to_run:
         if should_skip(model_name):
-            # 체크포인트에서 결과 복원
-            ckpt = torch.load(os.path.join(CFG['checkpoint_dir'], f'{model_name.replace(" ", "_")}_best.pth'),
+            ckpt = torch.load(os.path.join(CFG['checkpoint_dir'],
+                              f'{model_name.replace(" ", "_")}_best.pth'),
                               map_location='cpu')
-            ALL_RESULTS[model_name] = (ckpt['history'], ckpt['best_acc'], 0.)
+            ALL_RESULTS[model_name] = (ckpt['history'], ckpt['best_acc'], ckpt.get('train_mins', 0.))
             continue
         print(f'--- [START] {model_name} 학습을 시작합니다. ---', flush=True)
         model = model_fn()
@@ -845,7 +837,6 @@ if __name__ == '__main__':
         if MODEL_BAR:
             MODEL_BAR.update(1)
             MODEL_BAR.set_postfix(last=f'{model_name} {acc:.1f}%')
-        # OOM 방지: 모델을 CPU로 내리고 명시적 메모리 해제
         model.cpu()
         del model
         gc.collect()
@@ -861,7 +852,6 @@ if __name__ == '__main__':
     train_mins= [ALL_RESULTS[n][2] for n in names]
     colors    = [PALETTE.get(n, '#95A5A6') for n in names]
 
-    # 학습 커브
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle('Training Curves — Face-Mask Dataset', fontsize=13, fontweight='bold')
     for ax in axes:
@@ -884,7 +874,6 @@ if __name__ == '__main__':
     plt.close()
     print('result_curves.png 저장 완료', flush=True)
 
-    # 성능 바 차트
     fig2, axes2 = plt.subplots(1, 2, figsize=(13, 5))
     fig2.suptitle('Final Comparison — Face-Mask Dataset (CPU, 10 epochs)',
                   fontsize=12, fontweight='bold')
@@ -910,4 +899,3 @@ if __name__ == '__main__':
     for n in names:
         _, acc, mins = ALL_RESULTS[n]
         print(f'  {n:25s}  acc={acc:.2f}%   time={mins:.0f}min', flush=True)
-

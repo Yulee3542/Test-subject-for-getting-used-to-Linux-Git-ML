@@ -60,7 +60,7 @@ CFG = dict(
     crop_size     = 56,
     batch_size    = 16,             # 요청: 16
     train_ratio   = 0.8,
-    num_workers   = 4,              # i5-6500T 4코어 풀 활용
+    num_workers   = 0,              # i5-6500T 4코어 풀 활용
     num_classes   = 2,
 
     # 공통 학습
@@ -324,6 +324,7 @@ def run_training(model, name, is_snn=False, epochs=None):
         tr_loss, tr_acc = train_one_epoch(model, train_loader, opt, crit, is_snn)
         va_loss, va_acc = evaluate(model, test_loader, crit, is_snn)
         sched.step()
+        gc.collect()
 
         history['train_loss'].append(tr_loss)
         history['train_acc'].append(tr_acc)

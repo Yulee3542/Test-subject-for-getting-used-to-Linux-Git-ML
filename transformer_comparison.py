@@ -23,7 +23,7 @@
 
 # !pip install torch torchvision tqdm matplotlib
 
-import os, time, json, random, sys
+import os, time, json, random, sys, gc
 import numpy as np
 
 import torch

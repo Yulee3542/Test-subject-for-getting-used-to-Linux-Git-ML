@@ -1,25 +1,10 @@
 #!/usr/bin/env python
 # coding: utf-8
+# Face-Mask Classification: S²TDPT vs Spikformer vs Vanilla Transformer vs ResNet34
+# 환경: CPU-only (i5-6500T, 24GB RAM)
 
-# # Face-Mask Classification: S²TDPT vs Spikformer vs Vanilla Transformer vs ResNet34
-# 
-# **환경**: CPU-only (i5-6500T, 24GB RAM)  
-# **데이터**: face-mask dataset (with_mask / without_mask)  
-# **이미지 크기**: 64×64, **배치**: 16
-# 
-# | 모델 | 구현 근거 |
-# |------|----------|
-# | ResNet34 | 친구 코드(udyann.ipynb) 그대로 |
-# | Vanilla Transformer | ANN Transformer (MHSA + softmax) |
-# | Spikformer | SSA (Spiking Self-Attention, Zhou 2022) |
-# | **S²TDPT** | **논문 완전 재현** — SPS + S²TDPSA(STDP) + Spiking MLP |
-# 
-# > 경량화 설정 (CPU 밤샘 기준): L=2, D=128, T=4 timesteps, 10 epochs
-
-# ## 0. 환경 설정 & 공통 유틸
-
-# In[19]:
-
+import matplotlib
+matplotlib.use('Agg')
 
 # !pip install torch torchvision tqdm matplotlib
 
@@ -40,11 +25,11 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from tqdm import tqdm, trange
-from IPython.display import display, clear_output
 
 # ── 재현성 ──
 SEED = 42
-random.seed(SEED); np.random.seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -55,102 +40,90 @@ print(f'Torch : {torch.__version__}')
 #  하이퍼파라미터 
 # ═══════════════
 CFG = dict(
-    data_dir      = './data',       # ImageFolder 루트
-    img_size      = 64,             # 요청: 64
-    crop_size     = 56,
-    batch_size    = 16,             # 요청: 16
-    train_ratio   = 0.8,
-    num_workers   = 0,              # i5-6500T 4코어 풀 활용
-    num_classes   = 2,
+    data_dir      = './data',       # ImageFolder가 읽을 루트 폴더. with_mask/without_mask 폴더가 여기 있어야 함
+    img_size      = 64,             # 이미지를 64×64로 리사이즈
+    crop_size     = 56,             # 리사이즈 후 중앙 56×56만 잘라서 사용
+    batch_size    = 16,             # ANN 모델 한 번에 처리할 이미지 수
+    snn_batch_size= 4,              # SNN (Spikformer, S²TDPT) — T=4배 메모리
+    train_ratio   = 0.8,            # 전체 데이터의 80%를 학습, 20%를 검증에 사용
+    num_workers   = 0,              # 데이터 로딩 프로세스 수. CPU 학습이라 0
+    num_classes   = 2,              # with_mask / without_mask
 
     # 공통 학습
-    epochs        = 10,
-    lr            = 1e-3,
-    weight_decay  = 1e-4,
+    epochs        = 10,             # 전체 데이터를 10번 반복 학습
+    lr            = 1e-3,           # 학습률 0.001. AdamW에 사용
+    weight_decay  = 1e-4,           # L2 정규화 강도. 과적합 방지
 
     # Transformer 공통
-    embed_dim     = 256,            # 경량화 (논문=384)
-    num_heads     = 4,
-    depth         = 4,              # 레이어 수 (논문=4)
-    patch_size    = 8,              # 64/8 = 8×8 = 64 패치
-    mlp_ratio     = 2,
+    embed_dim     = 256,            # 패치 하나를 256차원 벡터로 표현. 논문은 384
+    num_heads     = 4,              # Multi-head attention의 head 수
+    depth         = 4,              # Transformer 블록을 4번 쌓음
+    patch_size    = 8,              # 56×56 이미지를 8×8 패치로 분할 → 7×7=49개 패치
+    mlp_ratio     = 2,              # MLP hidden dim = embed_dim × 2 = 512
 
     # SNN 전용
-    T             = 4,              # timesteps (논문=4)
-    tau           = 2.0,            # LIF 시정수
-    v_threshold   = 1.0,
-    v_reset       = 0.0,
+    T             = 4,              # 시간축 timestep 수. SNN은 T번 반복 처리해서 메모리 4배
+    tau           = 2.0,            # LIF 뉴런 시정수. 클수록 membrane potential이 천천히 감소
+    v_threshold   = 1.0,            # spike 발생 임계값. membrane이 이 값 넘으면 spike
+    v_reset       = 0.0,            # spike 후 membrane potential 초기화 값
 
     # STDP 전용
-    A_stdp        = 0.9,
-    tau_stdp      = 0.5,
-    w_offset      = 0.9,
+    A_stdp        = 0.9,            # STDP 학습 강도
+    tau_stdp      = 0.5,            # STDP 시정수. 작을수록 Δt에 민감하게 반응
+    w_offset      = 0.9,            # attention score 오프셋. ΔW + 0.9로 (0,1) 범위 유지
 
     checkpoint_dir = './checkpoints',
 )
 
-os.makedirs(CFG['checkpoint_dir'], exist_ok=True)
+os.makedirs(CFG['checkpoint_dir'], exist_ok=True)      # checkpoints 폴더 없으면 생성
 print('CFG loaded.')
 
 
-# ## 1. Dataset (udyann.ipynb 참고)
-
-# In[21]:
-
-
-# VGG16 mean/std — udyann.ipynb 그대로
+# ImageNet mean/std
 MEAN = [0.48235, 0.45882, 0.40784]
-STD  = [1.0/255.0, 1.0/255.0, 1.0/255.0]
+STD  = [0.229, 0.224, 0.225]
 
 transform = transforms.Compose([
-    transforms.Resize((CFG['img_size'], CFG['img_size'])),
-    transforms.CenterCrop(CFG['crop_size']),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=MEAN, std=STD),
+    transforms.Resize((CFG['img_size'], CFG['img_size'])),       # 이미지를 64×64로 리사이즈
+    transforms.CenterCrop(CFG['crop_size']),                     # 중앙 56×56 크롭 — 테두리 노이즈 제거
+    transforms.ToTensor(),                                       # PIL/numpy → [0,1] float 텐서, [C,H,W]로 변환
+    transforms.Normalize(mean=MEAN, std=STD),                    # (pixel - mean) / std 정규화
 ])
 
 dataset   = ImageFolder(CFG['data_dir'], transform=transform)
-n_train   = int(CFG['train_ratio'] * len(dataset))
-n_test    = len(dataset) - n_train
-train_ds, test_ds = random_split(dataset, [n_train, n_test],
-                                  generator=torch.Generator().manual_seed(SEED))
+# data/ 폴더 구조를 읽어서 폴더명을 클래스로 자동 인식
+# with_mask → 0, without_mask → 1 (알파벳 순)
 
-# ── udyann.ipynb 버그 수정: split된 subset을 DataLoader에 전달 ──
+n_train   = int(CFG['train_ratio'] * len(dataset))              # 80% 학습
+n_test    = len(dataset) - n_train                              # 20% 검증
+train_ds, test_ds = random_split(dataset, [n_train, n_test],
+                                  generator=torch.Generator().manual_seed(SEED))  # SEED 고정
+
 train_loader = DataLoader(train_ds, batch_size=CFG['batch_size'],
                           shuffle=True,  num_workers=CFG['num_workers'], pin_memory=False)
 test_loader  = DataLoader(test_ds,  batch_size=CFG['batch_size'],
                           shuffle=False, num_workers=CFG['num_workers'], drop_last=False)
-mini_loader  = DataLoader(train_ds, batch_size=4, shuffle=True)
+mini_loader  = DataLoader(train_ds, batch_size=4, shuffle=True)  # 샘플 확인용
 
 print(f'Classes : {dataset.classes}')
 print(f'Total   : {len(dataset)}  |  Train: {n_train}  |  Test: {n_test}')
 print(f'Batches : train={len(train_loader)}, test={len(test_loader)}')
 
 
-# In[22]:
-
-
 def denormalize(t):
-    """udyann.ipynb Cell 36 — Normalize 역변환"""
-    img = t.clone().permute(1,2,0).numpy()
-    for c in range(img.shape[2]):
-        img[:,:,c] = img[:,:,c] * STD[c] + MEAN[c]
-    return img.clip(0,1)
+    img = t.clone().permute(1,2,0).numpy()                   # [C,H,W] → [H,W,C] 변환 후 numpy로
+    for c in range(img.shape[2]):                            # R, G, B 채널별로 반복
+        img[:,:,c] = img[:,:,c] * STD[c] + MEAN[c]           # 역정규화: x*std + mean
+    return img.clip(0,1)                                     # 0~1 범위 벗어난 값 클리핑
 
-imgs, labs = next(iter(mini_loader))
-fig, axes = plt.subplots(1,4, figsize=(10,3))
-for ax, img, lb in zip(axes, imgs, labs):
-    ax.imshow(denormalize(img))
-    ax.set_title(dataset.classes[lb], fontsize=10)
-    ax.axis('off')
-plt.suptitle('Sample images (56×56 after crop)', fontweight='bold')
-plt.tight_layout(); plt.show()
-
-
-# ## 2. 공통 모듈 — LIF 뉴런 & 학습/평가 루프
-
-# In[23]:
-
+imgs, labs = next(iter(mini_loader))                         # mini_loader에서 배치 4장 꺼내기
+fig, axes = plt.subplots(1,4, figsize=(10,3))                # 1행 4열 subplot 생성
+for ax, img, lb in zip(axes, imgs, labs):                    # 이미지 4장 순서대로 처리
+    ax.imshow(denormalize(img))                              # 역정규화 후 이미지 표시
+    ax.set_title(dataset.classes[lb], fontsize=10)           # 클래스명을 제목으로
+    ax.axis('off')                                           # 축 숨기기
+plt.suptitle('Sample images (56×56 after crop)', fontweight='bold')  # 전체 제목
+plt.tight_layout()                                           # subplot 간격 자동 조정
 
 # ── Leaky Integrate-and-Fire (논문 Eq. 1-3) ──
 class LIFNode(nn.Module):
@@ -203,9 +176,6 @@ class TTFSEncoder(nn.Module):
 print('LIFNode & TTFSEncoder 정의 완료')
 
 
-# In[30]:
-
-
 def reset_lif(model):
     for m in model.modules():
         if isinstance(m, LIFNode):
@@ -244,30 +214,25 @@ def evaluate(model, loader, criterion, is_snn):
         total      += labels.size(0)
     return total_loss / len(loader), correct / total * 100
 
-from ipywidgets import Output
-_plot_out = Output()
-display(_plot_out)
-
 def _live_plot(history, name, color):
-    """에포크마다 Jupyter inline 커브 갱신"""
-    _plot_out.clear_output(wait=True)
-    with _plot_out:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 3.5))
-        fig.suptitle(f'Live Training  —  {name}', fontsize=12, fontweight='bold')
-        ep = range(1, len(history['train_loss'])+1)
-        axes[0].plot(ep, history['train_loss'], '--', color=color, alpha=0.6, label='train')
-        axes[0].plot(ep, history['val_loss'],         color=color, label='val')
-        axes[0].set(title='Loss', xlabel='Epoch')
-        axes[0].legend(fontsize=9)
-        axes[0].grid(True, alpha=0.3)
-        axes[1].plot(ep, history['train_acc'], '--', color=color, alpha=0.6, label='train')
-        axes[1].plot(ep, history['val_acc'],         color=color, label='val')
-        axes[1].set(title='Accuracy (%)', xlabel='Epoch')
-        axes[1].legend(fontsize=9)
-        axes[1].grid(True, alpha=0.3)
-        plt.tight_layout()
-        display(fig)
-        plt.close(fig)
+    """에포크마다 커브를 파일로 저장"""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.5))
+    fig.suptitle(f'Live Training  —  {name}', fontsize=12, fontweight='bold')
+    ep = range(1, len(history['train_loss'])+1)
+    axes[0].plot(ep, history['train_loss'], '--', color=color, alpha=0.6, label='train')
+    axes[0].plot(ep, history['val_loss'],         color=color, label='val')
+    axes[0].set(title='Loss', xlabel='Epoch')
+    axes[0].legend(fontsize=9)
+    axes[0].grid(True, alpha=0.3)
+    axes[1].plot(ep, history['train_acc'], '--', color=color, alpha=0.6, label='train')
+    axes[1].plot(ep, history['val_acc'],         color=color, label='val')
+    axes[1].set(title='Accuracy (%)', xlabel='Epoch')
+    axes[1].legend(fontsize=9)
+    axes[1].grid(True, alpha=0.3)
+    plt.tight_layout()
+    safe_name = name.replace(' ', '_').replace('²', '2')
+    plt.savefig(f'live_{safe_name}.png', bbox_inches='tight')
+    plt.close(fig)
 
 
 PALETTE = {
@@ -279,8 +244,6 @@ PALETTE = {
 
 
 def run_training(model, name, is_snn=False, epochs=None):
-    global _plot_out
-    _plot_out.clear_output()
     """
     진행바 3단계:
       [1] 배치 tqdm bar  (train + eval 각각)
@@ -324,7 +287,7 @@ def run_training(model, name, is_snn=False, epochs=None):
         tr_loss, tr_acc = train_one_epoch(model, train_loader, opt, crit, is_snn)
         va_loss, va_acc = evaluate(model, test_loader, crit, is_snn)
         sched.step()
-        gc.collect()
+        gc.collect()  # 에포크마다 순환 참조 즉시 해제
 
         history['train_loss'].append(tr_loss)
         history['train_acc'].append(tr_acc)
@@ -372,10 +335,8 @@ print('학습 유틸 + 프로그레스바 준비 완료')
 # ## 3. Model A — ResNet34 (베이스라인)
 # *udyann.ipynb 코드 그대로 사용*
 
-# In[31]:
-
-
 # ── udyann.ipynb Cell 12-13 ──
+
 class BasicBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
@@ -430,9 +391,6 @@ class ResNet(nn.Module):
 
 # ## 4. Model B — Vanilla Transformer (ANN)
 # *패치 임베딩 → MHSA (softmax) → MLP — SNN과 동일 구조로 공정 비교*
-
-# In[ ]:
-
 
 class PatchEmbed(nn.Module):
     """이미지를 패치 시퀀스로 변환 (CNN stem)"""
@@ -506,9 +464,6 @@ class VanillaTransformer(nn.Module):
 
 # ## 6. Model D — S²TDPT (논문 완전 재현)
 # *Mondal & Kumar 2025 — SPS + S²TDPSA (STDP Self-Attention) + Spiking MLP*
-
-# In[ ]:
-
 
 class SpikingPatchEmbed(nn.Module):
     """Spiking Patch Splitting — Conv+BN+LIF 스택"""
@@ -788,6 +743,7 @@ class S2TDPT(nn.Module):
 
 
 # ── should_skip: 이미 학습된 모델 건너뛰기 ──
+
 def should_skip(model_name):
     safe_name = model_name.replace(' ', '_')
     file_path = os.path.join(CFG['checkpoint_dir'], f'{safe_name}_best.pth')
